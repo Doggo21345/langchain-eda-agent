@@ -2,6 +2,7 @@
 
     eda-agent profile data.csv            # deterministic profile + report, no LLM
     eda-agent ask data.csv "question"     # LangChain agent answers / writes a report
+    eda-agent profile --table orders      # database table (URL from $EDA_DB_URL)
     eda-agent history [dataset]           # run-over-run availability & quality log
 """
 
@@ -10,42 +11,73 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import plots, profiling, report
-from .data import DEFAULT_SAMPLE_ROWS, load_dataset
+import os
+
+from .data import DEFAULT_SAMPLE_ROWS, load_dataset, load_sql, redact_url
 from .run_log import RunLogger, setup_logging
 from .tools import Workspace
 
 DEFAULT_QUESTION = "Do a full exploratory analysis of this data and write the report."
 
 
-def _load(paths: list[str], sample_rows: int, logger: RunLogger):
+def _load(args, logger: RunLogger):
     datasets = {}
-    for p in paths:
+    for p in args.paths:
         path = Path(p)
         try:
-            ds = load_dataset(path, sample_rows=sample_rows)
+            ds = load_dataset(path, sample_rows=args.sample_rows)
             datasets[ds.name] = ds
         except (FileNotFoundError, ValueError, OSError) as e:
             logger.record_missing(path.stem, path, str(e))
+
+    if args.table or args.query:
+        url = os.environ.get(args.db_url_env)
+        if not url:
+            raise SystemExit(f"set {args.db_url_env} to a SQLAlchemy database URL (e.g. sqlite:///data/orders.db)")
+        safe_url = redact_url(url)
+        sources = [("table", t) for t in args.table] + [("query", q) for q in args.query]
+        for i, (kind, value) in enumerate(sources):
+            name = value.rpartition(".")[2] if kind == "table" else f"query{i}" if len(args.query) > 1 else "query"
+            try:
+                ds = load_sql(url, **{kind: value}, name=name, sample_rows=args.sample_rows)
+                datasets[ds.name] = ds
+            except Exception as e:  # driver errors vary by database
+                msg = str(e).replace(url, safe_url).splitlines()[0]
+                logger.record_missing(name, f"{safe_url} {kind}", msg)
+
+    if not datasets and not (args.paths or args.table or args.query):
+        raise SystemExit("give at least one file path, --table, or --query")
     return datasets
+
+
+def _add_sources(sp):
+    sp.add_argument("paths", nargs="*", help="CSV/TSV/JSON/JSONL/Parquet files")
+    sp.add_argument("--table", action="append", default=[], help="database table to profile (repeatable)")
+    sp.add_argument("--query", action="append", default=[], help="SELECT query to profile (repeatable)")
+    sp.add_argument("--db-url-env", default="EDA_DB_URL",
+                    help="environment variable holding the SQLAlchemy URL (default: EDA_DB_URL)")
+    sp.add_argument("--sample-rows", type=int, default=DEFAULT_SAMPLE_ROWS)
 
 
 def cmd_profile(args) -> int:
     out = Path(args.out)
     logger = RunLogger(out / "runs.jsonl")
-    datasets = _load(args.paths, args.sample_rows, logger)
+    datasets = _load(args, logger)
     if not datasets:
         return 1
     for ds in datasets.values():
+        t0 = time.perf_counter()
         prof = profiling.full_profile(ds)
         charts = [] if args.no_plots else plots.standard_plots(ds, out / "plots" / ds.name)
-        run = logger.record_run(ds)
+        run = logger.record_run(ds, work_seconds=time.perf_counter() - t0)
         path = report.render(prof, charts, out / f"{ds.name}_report.md", run=run)
         (out / f"{ds.name}_profile.json").write_text(json.dumps(prof, indent=2, default=str))
         print(f"{ds.name}: {ds.scan.row_count:,} rows, quality {prof['quality']['quality_score']}/100, "
-              f"{len(run['changes'])} change(s) vs last run -> {path}")
+              f"{len(run['changes'])} change(s) vs last run, {run['run_seconds']}s -> {path}")
     return 0
 
 
@@ -54,7 +86,7 @@ def cmd_ask(args) -> int:
 
     out = Path(args.out)
     logger = RunLogger(out / "runs.jsonl")
-    datasets = _load(args.paths, args.sample_rows, logger)
+    datasets = _load(args, logger)
     if not datasets:
         return 1
     ws = Workspace(datasets=datasets, out_dir=out, run_logger=logger)
@@ -88,16 +120,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("profile", help="profile datasets without an LLM")
-    pr.add_argument("paths", nargs="+")
-    pr.add_argument("--sample-rows", type=int, default=DEFAULT_SAMPLE_ROWS)
+    _add_sources(pr)
     pr.add_argument("--no-plots", action="store_true")
     pr.set_defaults(fn=cmd_profile)
 
     a = sub.add_parser("ask", help="let the LangChain agent analyse the data")
-    a.add_argument("paths", nargs="+")
+    _add_sources(a)
     a.add_argument("-q", "--question", default=DEFAULT_QUESTION)
     a.add_argument("--model", default=None, help="LangChain provider:model, e.g. anthropic:claude-sonnet-5-5")
-    a.add_argument("--sample-rows", type=int, default=DEFAULT_SAMPLE_ROWS)
     a.set_defaults(fn=cmd_ask)
 
     h = sub.add_parser("history", help="show logged runs")

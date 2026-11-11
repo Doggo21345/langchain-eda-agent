@@ -32,8 +32,9 @@ question ──▶ │  LLM plans the analysis ──▶ calls tools ──▶ r
      └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Scaling to large files.** `data.py` streams CSV, TSV, JSONL, and Parquet in chunks (250k rows by
-default). Row counts, null counts, min/max/mean, and duplicate rows (via 8-byte row hashes)
+**Scaling to large files and tables.** `data.py` streams CSV, TSV, JSONL, Parquet, and database
+tables or queries (any SQLAlchemy database: Postgres, MySQL, Redshift, Snowflake, SQLite, ...)
+in chunks (250k rows by default). Row counts, null counts, min/max/mean, and duplicate rows (via 8-byte row hashes)
 are exact across every row. Quantiles, skew, correlations, and plots use a uniform random sample
 (100k rows by default; each row gets a random key and the smallest keys are kept). The report
 says when a statistic comes from the sample.
@@ -90,11 +91,25 @@ eda-agent ask data/orders.csv                              # full EDA + report
 eda-agent ask data/orders.csv -q "Which device has the worst latency?"
 eda-agent ask data/orders.csv --model openai:gpt-5         # any LangChain provider:model (pip install ".[openai]")
 
-# 3) simulate a bad pipeline day, then look at the run log
+# 3) a database table or query instead of a file (pip install ".[sql]")
+python examples/make_sample_data.py --rows 200000 --out data/shop.db
+export EDA_DB_URL=sqlite:///data/shop.db          # e.g. postgresql://user:pass@host/db
+eda-agent profile --table orders
+eda-agent ask --query "SELECT device, app_latency_ms, churned_90d FROM orders" -q "Does latency differ by device?"
+
+# 4) simulate a bad pipeline day, then look at the run log
 python examples/make_sample_data.py --rows 300000 --out day2/orders.csv --degrade
 eda-agent profile day2/orders.csv
 eda-agent history orders
 ```
+
+The database URL is read from an environment variable (`EDA_DB_URL`, or pick another with
+`--db-url-env`), and the password is redacted everywhere it's logged. Only the table or query you
+pass is run. The agent never writes SQL, and table names are checked against the database
+before use.
+
+Each run log entry records `load_seconds` and `run_seconds`, so you can track profiling time
+across runs.
 
 Outputs land in `eda_output/`: `<name>_report.md`, `<name>_profile.json`, `plots/`,
 `runs.jsonl`, and `eda_agent.log`.
@@ -142,7 +157,8 @@ print(ask(ws, "Summarise data quality risks"))
 pytest
 ```
 
-The tests cover exact-vs-sampled statistics, the quality rules, run-over-run diffing, and an
+The tests cover exact-vs-sampled statistics, the quality rules, run-over-run diffing, the SQL
+source (it must match the file scan exactly, reject unknown tables, and redact passwords), and an
 end-to-end agent run. The agent test drives the real LangChain `create_agent` loop with a
 scripted chat model, so it needs no API key.
 
@@ -150,7 +166,7 @@ scripted chat model, so it needs no API key.
 
 ```
 src/eda_agent/
-  data.py        chunked loading, full-file scan, uniform sampling
+  data.py        chunked file/SQL loading, full scan, uniform sampling
   profiling.py   schema, null audit, distributions, correlations, quality rules
   plots.py       histograms, null bars, correlation heatmap, scatter
   run_log.py     logging setup, runs.jsonl, run-over-run comparison

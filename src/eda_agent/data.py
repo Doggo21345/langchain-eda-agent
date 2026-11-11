@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,12 +48,13 @@ class FullScan:
 @dataclass
 class Dataset:
     name: str
-    path: Path
+    path: str  # file path, or a password-redacted database URL + table/query
     sample: pd.DataFrame
     scan: FullScan
     file_bytes: int
     modified_at: float
     sampled: bool
+    load_seconds: float = 0.0
 
     @property
     def schema_hash(self) -> str:
@@ -92,12 +94,20 @@ def load_dataset(
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     seed: int = 0,
 ) -> Dataset:
+    """Load a CSV/TSV/JSON/JSONL/Parquet file."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(path)
     if path.suffix.lower() not in SUPPORTED:
         raise ValueError(f"unsupported file type {path.suffix}; use one of {sorted(SUPPORTED)}")
+    stat = os.stat(path)
+    return _scan(_iter_chunks(path, chunk_rows), name or path.stem, str(path),
+                 stat.st_size, stat.st_mtime, sample_rows, seed)
 
+
+def _scan(chunks, name: str, source: str, file_bytes: int, modified_at: float,
+          sample_rows: int, seed: int) -> Dataset:
+    t0 = time.perf_counter()
     rng = np.random.default_rng(seed)
     row_count = 0
     nulls: pd.Series | None = None
@@ -109,7 +119,7 @@ def load_dataset(
     row_hashes: list[np.ndarray] = []
     n_chunks = 0
 
-    for chunk in _iter_chunks(path, chunk_rows):
+    for chunk in chunks:
         n_chunks += 1
         row_count += len(chunk)
         chunk_nulls = chunk.isna().sum()
@@ -151,17 +161,64 @@ def load_dataset(
         numeric_max=maxs,
         numeric_mean={c: sums[c] / non_null[c] for c in sums if non_null.get(c)},
     )
-    stat = os.stat(path)
     log.info(
-        "loaded %s: %d rows in %d chunk(s), sample=%d rows (sampled=%s)",
-        path.name, row_count, n_chunks, len(sample), sampled,
+        "loaded %s from %s: %d rows in %d chunk(s), sample=%d rows (sampled=%s)",
+        name, source, row_count, n_chunks, len(sample), sampled,
     )
     return Dataset(
-        name=name or path.stem,
-        path=path,
+        name=name,
+        path=source,
         sample=sample,
         scan=scan,
-        file_bytes=stat.st_size,
-        modified_at=stat.st_mtime,
+        file_bytes=file_bytes,
+        modified_at=modified_at,
         sampled=sampled,
+        load_seconds=round(time.perf_counter() - t0, 3),
     )
+
+
+def redact_url(url: str) -> str:
+    """Database URL with any password replaced by ***, safe to log."""
+    from sqlalchemy.engine import make_url
+
+    return make_url(url).render_as_string(hide_password=True)
+
+
+def load_sql(
+    url: str,
+    table: str | None = None,
+    query: str | None = None,
+    name: str | None = None,
+    sample_rows: int = DEFAULT_SAMPLE_ROWS,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    seed: int = 0,
+) -> Dataset:
+    """Stream a table or a SELECT query from any SQLAlchemy-supported database.
+
+    The URL should come from the environment (e.g. EDA_DB_URL) rather than be
+    hard-coded; passwords are redacted from everything this package logs.
+    Only the table or query you pass is run: the agent never writes SQL.
+    """
+    from sqlalchemy import create_engine, inspect, select, table as sa_table, text
+
+    if (table is None) == (query is None):
+        raise ValueError("pass exactly one of table or query")
+    engine = create_engine(url)
+    try:
+        if table is not None:
+            schema_name, _, tname = table.rpartition(".")
+            if tname not in inspect(engine).get_table_names(schema=schema_name or None):
+                raise ValueError(f"table {table!r} not found")
+            # Build the statement from the validated name instead of string formatting.
+            stmt = select(text("*")).select_from(sa_table(tname, schema=schema_name or None))
+            label, default_name = f"{redact_url(url)} table={table}", tname
+        else:
+            stmt, label, default_name = text(query), f"{redact_url(url)} query", "query"
+
+        def chunks():
+            with engine.connect().execution_options(stream_results=True) as conn:
+                yield from pd.read_sql(stmt, conn, chunksize=chunk_rows)
+
+        return _scan(chunks(), name or default_name, label, 0, 0.0, sample_rows, seed)
+    finally:
+        engine.dispose()

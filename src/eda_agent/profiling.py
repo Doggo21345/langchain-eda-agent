@@ -49,7 +49,8 @@ def schema(ds: Dataset) -> dict:
         "columns": len(df.columns),
         "sampled": ds.sampled,
         "sample_rows": len(df),
-        "file_mb": _r(ds.file_bytes / 1e6, 2),
+        "source": ds.path,
+        "file_mb": _r(ds.file_bytes / 1e6, 2) if ds.file_bytes else None,
         "schema_hash": ds.schema_hash,
         "schema": cols,
     }

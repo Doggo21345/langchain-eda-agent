@@ -19,8 +19,9 @@ def render(profile: dict, plots: list[str], out_path: Path, run: dict | None = N
     s, n, q = profile["schema"], profile["nulls"], profile["quality"]
     lines = [f"# EDA report: {s['dataset']}\n"]
     lines.append(
-        f"**{s['rows']:,} rows x {s['columns']} columns** · {s['file_mb']} MB · "
-        f"quality score **{q['quality_score']}/100** · schema `{s['schema_hash']}`"
+        f"**{s['rows']:,} rows x {s['columns']} columns** · "
+        + (f"{s['file_mb']} MB · " if s.get("file_mb") is not None else f"`{s.get('source')}` · ")
+        + f"quality score **{q['quality_score']}/100** · schema `{s['schema_hash']}`"
     )
     if s["sampled"]:
         lines.append(f"\nExact counts use all rows; shape statistics use a uniform sample of {s['sample_rows']:,} rows.")

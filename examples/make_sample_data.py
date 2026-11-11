@@ -2,6 +2,7 @@
 
     python examples/make_sample_data.py --rows 500000 --out data/orders.csv
     python examples/make_sample_data.py --rows 300000 --out data/orders_day2.csv --degrade
+    python examples/make_sample_data.py --rows 200000 --out data/shop.db   # SQLite table "orders"
 
 `--degrade` simulates a bad pipeline day (fewer rows, a dropped column, more
 nulls) so you can see the run-over-run checks fire.
@@ -61,5 +62,11 @@ if __name__ == "__main__":
     a = ap.parse_args()
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     df = make(a.rows, a.seed, a.degrade)
-    (df.to_parquet if a.out.endswith(".parquet") else df.to_csv)(a.out, index=False)
+    if a.out.endswith(".db"):
+        import sqlite3
+
+        with sqlite3.connect(a.out) as con:
+            df.to_sql("orders", con, if_exists="replace", index=False)
+    else:
+        (df.to_parquet if a.out.endswith(".parquet") else df.to_csv)(a.out, index=False)
     print(f"wrote {len(df):,} rows x {df.shape[1]} cols -> {a.out}")

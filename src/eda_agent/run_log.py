@@ -45,6 +45,7 @@ class RunLogger:
     path: Path
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
     tool_calls: list[dict] = field(default_factory=list)
+    started: float = field(default_factory=time.perf_counter)
 
     def record_tool(self, name: str, args: dict, seconds: float, ok: bool, error: str | None = None) -> None:
         entry = {"tool": name, "args": args, "seconds": round(seconds, 3), "ok": ok}
@@ -78,17 +79,22 @@ class RunLogger:
             "issue_count": quality["issue_count"],
         }
 
-    def record_run(self, ds: Dataset) -> dict:
+    def record_run(self, ds: Dataset, work_seconds: float | None = None) -> dict:
+        """Log a run. `work_seconds` is time spent profiling/analysing after load;
+        defaults to the time since this logger was created (e.g. a whole agent session)."""
         snap = self.snapshot(ds)
         prev = self.history(ds.name)
         snap["changes"] = compare(prev[-1], snap) if prev else []
         snap["tool_calls"] = self.tool_calls
+        snap["load_seconds"] = ds.load_seconds
+        work = time.perf_counter() - self.started if work_seconds is None else work_seconds
+        snap["run_seconds"] = round(ds.load_seconds + work, 3)
         self._append(snap)
         for c in snap["changes"]:
             log.warning("[%s] %s", ds.name, c["message"])
         return snap
 
-    def record_missing(self, name: str, path: Path, error: str) -> dict:
+    def record_missing(self, name: str, path: Path | str, error: str) -> dict:
         entry = {
             "run_id": self.run_id,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
