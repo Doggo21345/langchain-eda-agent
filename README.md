@@ -13,24 +13,55 @@ eda-agent ask data/orders.csv -q "Is this data trustworthy, and what drives chur
 
 ## How it works
 
+> Full deep dive with diagrams for every layer: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+
+```mermaid
+flowchart LR
+    SRC[("Files: CSV · Parquet · JSONL<br/>or a SQL table / query")] --> LOAD
+    subgraph LOAD["1 · Load (data.py)"]
+        direction TB
+        SCAN["Full scan<br/>exact rows, nulls,<br/>min/max/mean, duplicates"]
+        SAMP["Uniform random sample<br/>for quantiles, correlations, charts"]
+    end
+    LOAD --> PROF["2 · Profile (profiling.py, plots.py)<br/>schema · null audit · distributions<br/>correlations · quality rules · charts"]
+    PROF --> TOOLS["3 · Tools (tools.py)<br/>11 LangChain tools<br/>timed + logged"]
+    TOOLS <--> LLM{{"LLM agent<br/>picks what to analyse,<br/>explains findings"}}
+    PROF --> LOG[("4 · Run log (runs.jsonl)<br/>diff vs last run:<br/>row drops · schema changes · null spikes")]
+    TOOLS --> OUT["5 · Report<br/>report.md + charts + profile.json"]
+    LOG --> OUT
 ```
-             ┌───────────────────── LangChain agent (create_agent) ─────────────────────┐
-question ──▶ │  LLM plans the analysis ──▶ calls tools ──▶ reads JSON results ──▶ answer │ ──▶ report.md + charts
-             └───────────────────────────────────┬──────────────────────────────────────┘
-                                                 │
-     ┌───────────────────────────────────────────┴───────────────────────────────────────────┐
-     │ tools.py  describe_schema · null_audit · distribution_overview · profile_column ·     │
-     │           correlation_analysis · data_quality_check · group_aggregate · plot ·         │
-     │           run_history · write_report          (each call timed + logged)               │
-     ├───────────────────────────────────────────────────────────────────────────────────────┤
-     │ profiling.py / plots.py   deterministic pandas + matplotlib, JSON-serialisable output  │
-     ├───────────────────────────────────────────────────────────────────────────────────────┤
-     │ data.py   chunked full-file scan (exact counts) + uniform random sample (shape stats)  │
-     ├───────────────────────────────────────────────────────────────────────────────────────┤
-     │ run_log.py   runs.jsonl: availability, rows, schema hash, null rates, quality score,   │
-     │              and the diff against the previous run of the same dataset                 │
-     └───────────────────────────────────────────────────────────────────────────────────────┘
+
+**The core idea: the LLM decides, code computes.** The model never writes pandas code and
+never states a number it worked out itself. It picks from a fixed set of tools (`null_audit`,
+`profile_column`, `correlation_analysis`, `plot`, ...). Each tool runs tested pandas/matplotlib
+code and returns compact JSON. The model reads the JSON, decides what to look at next, and
+writes up the findings. So the numbers are reproducible, there's no arbitrary code execution,
+and the same profiling also runs with **no LLM at all** (`eda-agent profile`).
+
+### The agent loop
+
+```mermaid
+sequenceDiagram
+    actor U as You
+    participant A as LLM agent
+    participant T as Tools
+    U->>A: "Is this data trustworthy? What drives churn?"
+    A->>T: describe_schema()
+    T-->>A: 14 columns, types, examples
+    A->>T: null_audit() · data_quality_check()
+    T-->>A: coupon_code 85% null, -1.0 sentinels, 0.2% duplicates
+    A->>T: correlation_analysis() · profile_column("app_latency_ms")
+    T-->>A: churn vs sessions r=-0.24, latency r=0.19, right-skewed
+    A->>T: plot("scatter", ...) · run_history()
+    T-->>A: chart saved · last run had 501k rows
+    A->>T: write_report(summary)
+    A-->>U: answer + report.md + charts
 ```
+
+The agent is built with LangChain 1.x `create_agent` (a LangGraph tool-calling loop, capped at
+40 steps). Tool errors, such as a misspelled column, go back to the model as messages that list
+the valid options, so it can correct itself. Every tool call is timed and saved in the run log,
+so you can audit what the agent looked at before it reached its conclusions.
 
 **Scaling to large files and tables.** `data.py` streams CSV, TSV, JSONL, Parquet, and database
 tables or queries (any SQLAlchemy database: Postgres, MySQL, Redshift, Snowflake, SQLite, ...)
@@ -38,10 +69,6 @@ in chunks (250k rows by default). Row counts, null counts, min/max/mean, and dup
 are exact across every row. Quantiles, skew, correlations, and plots use a uniform random sample
 (100k rows by default; each row gets a random key and the smallest keys are kept). The report
 says when a statistic comes from the sample.
-
-**Why tools instead of letting the LLM write pandas.** Tools keep numbers reproducible and
-stop the model from inventing statistics. Tool errors go back to the model as messages, so it can
-recover, for example after asking for a column that doesn't exist.
 
 ### Data quality checks
 
