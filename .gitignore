@@ -9,3 +9,4 @@ eda_output/
 data/*.csv
 data/*.parquet
 .env
+data/*.db
